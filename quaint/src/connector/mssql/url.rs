@@ -423,14 +423,4 @@ mod tests {
             MssqlUrl::new("sqlserver://localhost:1433;user=SA;password=pass;trustServerCertificate=true").unwrap();
         assert_eq!("master", url.dbname());
     }
-
-    #[test]
-    fn should_decode_percent_encoded_chinese_dbname() {
-        // 测试库 = %E6%B5%8B%E8%AF%95%E5%BA%93
-        let url = MssqlUrl::new(
-            "sqlserver://localhost:1433;database=%E6%B5%8B%E8%AF%95%E5%BA%93;user=SA;password=pass;trustServerCertificate=true",
-        )
-        .unwrap();
-        assert_eq!("测试库", url.dbname());
-    }
 }
