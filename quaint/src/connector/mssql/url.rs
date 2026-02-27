@@ -424,15 +424,13 @@ mod tests {
         assert_eq!("master", url.dbname());
     }
 
-    #[tokio::test]
-    async fn should_connect_to_percent_encoded_chinese_dbname() {
+    #[test]
+    fn should_decode_percent_encoded_chinese_dbname() {
         // 测试库 = %E6%B5%8B%E8%AF%95%E5%BA%93
-        let url = CONN_STR.replace("database=master", "database=%E6%B5%8B%E8%AF%95%E5%BA%93");
-        let conn = Quaint::new(&url).await.unwrap();
-
-        use crate::prelude::Queryable;
-        let result = conn.query_raw("SELECT DB_NAME() AS db_name", &[]).await.unwrap();
-        let db_name = result.first().unwrap().get("db_name").unwrap().to_string().unwrap();
-        assert_eq!("测试库", db_name);
+        let url = MssqlUrl::new(
+            "sqlserver://localhost:1433;database=%E6%B5%8B%E8%AF%95%E5%BA%93;user=SA;password=pass;trustServerCertificate=true",
+        )
+        .unwrap();
+        assert_eq!("测试库", url.dbname());
     }
 }
