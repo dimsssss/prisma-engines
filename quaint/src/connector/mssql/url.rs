@@ -400,20 +400,27 @@ mod tests {
 
     #[test]
     fn should_decode_dbname_with_spaces() {
-        let url = MssqlUrl::new("sqlserver://localhost:1433;database=my%20database;user=SA;password=pass;trustServerCertificate=true").unwrap();
+        let url = MssqlUrl::new(
+            "sqlserver://localhost:1433;database=my%20database;user=SA;password=pass;trustServerCertificate=true",
+        )
+        .unwrap();
         assert_eq!("my database", url.dbname());
     }
 
     #[test]
     fn should_decode_dbname_with_special_characters() {
         // test-db_name
-        let url = MssqlUrl::new("sqlserver://localhost:1433;database=test%2Ddb%5Fname;user=SA;password=pass;trustServerCertificate=true").unwrap();
+        let url = MssqlUrl::new(
+            "sqlserver://localhost:1433;database=test%2Ddb%5Fname;user=SA;password=pass;trustServerCertificate=true",
+        )
+        .unwrap();
         assert_eq!("test-db_name", url.dbname());
     }
 
     #[test]
     fn should_return_master_as_default_dbname() {
-        let url = MssqlUrl::new("sqlserver://localhost:1433;user=SA;password=pass;trustServerCertificate=true").unwrap();
+        let url =
+            MssqlUrl::new("sqlserver://localhost:1433;user=SA;password=pass;trustServerCertificate=true").unwrap();
         assert_eq!("master", url.dbname());
     }
 
