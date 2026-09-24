@@ -12,6 +12,7 @@ use sql_migration_tests::{
     utils::{list_migrations, to_schema_containers},
 };
 use std::sync::Arc;
+use user_facing_errors::schema_engine::ShadowDbSameAsMainDb;
 
 #[test_connector(tags(Sqlite, Mysql, Postgres, CockroachDb, Mssql))]
 fn from_unique_index_to_without(mut api: TestApi) {
@@ -66,7 +67,6 @@ fn from_unique_index_to_without(mut api: TestApi) {
                 content: from_schema.to_string(),
             }],
         }),
-        shadow_database_url: None,
         to: DiffTarget::SchemaDatamodel(SchemasContainer {
             files: vec![SchemaContainer {
                 path: to_file.to_string_lossy().into_owned(),
@@ -177,7 +177,6 @@ fn from_unique_index_to_pk(mut api: TestApi) {
                 content: from_schema.to_string(),
             }],
         }),
-        shadow_database_url: None,
         to: DiffTarget::SchemaDatamodel(SchemasContainer {
             files: vec![SchemaContainer {
                 path: to_file.to_string_lossy().into_owned(),
@@ -369,7 +368,6 @@ fn from_empty_to_migrations_directory(mut api: TestApi) {
         from: DiffTarget::Empty,
         to: DiffTarget::Migrations(migrations_list),
         script: true,
-        shadow_database_url: Some(api.connection_string().to_owned()),
         filters: SchemaFilter::default(),
     };
 
@@ -381,6 +379,7 @@ fn from_empty_to_migrations_directory(mut api: TestApi) {
             shadow_database_url: Some(api.connection_string().to_owned()),
         },
         host.clone(),
+        BitFlags::empty(),
         &NoExtensionTypes,
     ))
     .unwrap();
@@ -420,7 +419,6 @@ fn from_empty_to_migrations_folder_without_shadow_db_url_must_error(mut api: Tes
         from: DiffTarget::Empty,
         to: DiffTarget::Migrations(migrations_list),
         script: true,
-        shadow_database_url: None, // TODO: ?
         filters: SchemaFilter::default(),
     };
 
@@ -435,9 +433,126 @@ fn from_empty_to_migrations_folder_without_shadow_db_url_must_error(mut api: Tes
         .unwrap_err();
 
     let expected_error = expect![[r#"
-        You must pass the `--shadow-database-url` flag or set `datasource.shadowDatabaseUrl` in your `prisma.config.ts` if you want to diff a migrations directory.
+        You must set `datasource.shadowDatabaseUrl` in your `prisma.config.ts` if you want to diff a migrations directory.
     "#]];
     expected_error.assert_eq(&err.to_string());
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_migrations_with_the_datasource_database_as_shadow_db_must_error(mut api: TestApi) {
+    let migrations_dir = migrations_directory_with_one_migration(&api);
+    let main_url = api.connection_string().to_owned();
+
+    api.raw_cmd("CREATE TABLE precious_data (id INTEGER PRIMARY KEY)");
+
+    // The same database, spelled the way it is configured and spelled differently.
+    let differently_spelled = main_url
+        .replacen("postgresql://", "postgres://", 1)
+        .replace("localhost", "LOCALHOST");
+    assert_ne!(differently_spelled, main_url);
+
+    for shadow_database_url in [main_url.clone(), differently_spelled] {
+        let err = api
+            .diff_with_datasource(
+                &DatasourceUrls {
+                    url: Some(main_url.clone()),
+                    shadow_database_url: Some(shadow_database_url.clone()),
+                },
+                DiffParams {
+                    exit_code: None,
+                    from: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+                    to: DiffTarget::Empty,
+                    script: false,
+                    filters: SchemaFilter::default(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            err.is_user_facing_error::<ShadowDbSameAsMainDb>(),
+            "shadow database url {shadow_database_url}: {err:?}"
+        );
+    }
+
+    // The migration history is replayed into the shadow database after wiping it, so the diff must
+    // not have run at all.
+    api.assert_schema().assert_has_table("precious_data");
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_url_to_migrations_with_that_url_as_shadow_db_must_error(mut api: TestApi) {
+    let migrations_dir = migrations_directory_with_one_migration(&api);
+    let main_url = api.connection_string().to_owned();
+
+    api.raw_cmd("CREATE TABLE precious_data (id INTEGER PRIMARY KEY)");
+
+    let err = api
+        .diff_with_datasource(
+            &DatasourceUrls {
+                url: None,
+                shadow_database_url: Some(main_url.clone()),
+            },
+            DiffParams {
+                exit_code: None,
+                from: DiffTarget::Url(UrlContainer { url: main_url }),
+                to: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+                script: false,
+                filters: SchemaFilter::default(),
+            },
+        )
+        .unwrap_err();
+
+    assert!(err.is_user_facing_error::<ShadowDbSameAsMainDb>(), "{err:?}");
+    api.assert_schema().assert_has_table("precious_data");
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_migrations_with_a_separate_shadow_db_on_the_same_server_works(mut api: TestApi) {
+    let migrations_dir = migrations_directory_with_one_migration(&api);
+
+    let (result, diff) = diff_result(
+        DatasourceUrls {
+            url: Some(api.connection_string().to_owned()),
+            shadow_database_url: Some(api.create_external_shadow_database()),
+        },
+        DiffParams {
+            exit_code: Some(true),
+            from: DiffTarget::Empty,
+            to: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+            script: false,
+            filters: SchemaFilter::default(),
+        },
+    );
+
+    assert_eq!(result.exit_code, 2);
+    let expected_diff = expect![[r#"
+
+        [+] Added Schemas
+          - public
+
+        [+] Added tables
+          - cats
+    "#]];
+    expected_diff.assert_eq(&diff);
+}
+
+fn migrations_directory_with_one_migration(api: &TestApi) -> tempfile::TempDir {
+    let migrations_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        migrations_dir.path().join("migration_lock.toml"),
+        format!("provider = \"{}\"", api.args().provider()),
+    )
+    .unwrap();
+
+    let migration_dir = migrations_dir.path().join("01init");
+    std::fs::create_dir_all(&migration_dir).unwrap();
+    std::fs::write(
+        migration_dir.join("migration.sql"),
+        "CREATE TABLE cats ( id INTEGER PRIMARY KEY );",
+    )
+    .unwrap();
+
+    migrations_dir
 }
 
 #[test_connector(tags(Sqlite))]
@@ -477,7 +592,6 @@ fn from_schema_datamodel_to_url(mut api: TestApi) {
             }],
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter::default(),
     };
@@ -529,7 +643,6 @@ fn from_schema_datasource_relative(api: TestApi) {
             config_dir: schema_path.parent().unwrap().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Empty,
         filters: SchemaFilter::default(),
     };
@@ -589,7 +702,6 @@ fn from_schema_datasource_to_url(mut api: TestApi) {
             config_dir: schema_path.parent().unwrap().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter::default(),
     };
@@ -648,7 +760,6 @@ fn with_schema_filters(api: TestApi) {
             config_dir: schema_path.parent().unwrap().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter {
             external_tables: vec!["external_table".to_string()],
@@ -703,7 +814,6 @@ fn with_invalid_schema_filter_sqlite(mut api: TestApi) {
             config_dir: schema_path.parent().unwrap().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter {
             external_tables: vec!["public.external_table".to_string()],
@@ -742,7 +852,6 @@ fn with_invalid_schema_filter_postgres(mut api: TestApi) {
             config_dir: schema_path.parent().unwrap().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer {
             url: connection_string.to_string(),
         }),
@@ -785,7 +894,6 @@ fn from_url_to_url(mut api: TestApi) {
         exit_code: None,
         from: DiffTarget::Url(UrlContainer { url: first_url }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter::default(),
     };
@@ -844,7 +952,6 @@ fn diffing_mongo_schemas_to_script_returns_a_nice_error() {
                 content: from.to_string(),
             }],
         }),
-        shadow_database_url: None,
         to: DiffTarget::SchemaDatamodel(SchemasContainer {
             files: vec![SchemaContainer {
                 path: to_file.to_string_lossy().into_owned(),
@@ -878,7 +985,6 @@ fn diff_sqlite_migration_directories() {
         exit_code: None,
         from: DiffTarget::Migrations(migrations_list),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Migrations(migrations_list_2),
         filters: SchemaFilter::default(),
     };
@@ -890,6 +996,206 @@ fn diff_sqlite_migration_directories() {
     )
     .unwrap();
     // it's ok!
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_migrations_to_schema_datamodel_ignores_manual_partial_indexes_without_preview_feature(api: TestApi) {
+    let migrations_dir = tempfile::tempdir().unwrap();
+    let migration_dir = migrations_dir.path().join("01init");
+    let migration_file = migration_dir.join("migration.sql");
+    let schema_name = api.schema_name();
+
+    std::fs::write(
+        migrations_dir.path().join("migration_lock.toml"),
+        format!("provider = \"{}\"", api.args().provider()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&migration_dir).unwrap();
+    std::fs::write(
+        migration_file,
+        format!(
+            r#"CREATE SCHEMA IF NOT EXISTS "{schema_name}";
+             CREATE TABLE "{schema_name}"."User" (
+                 "id" INTEGER NOT NULL,
+                 "email" TEXT NOT NULL,
+                 CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+             );
+             CREATE INDEX "User_email_partial_idx" ON "{schema_name}"."User" ("email") WHERE "email" IS NOT NULL;"#
+        ),
+    )
+    .unwrap();
+
+    let datamodel = api.datamodel_with_provider(
+        r#"
+        model User {
+            id    Int    @id
+            email String
+        }
+    "#,
+    );
+    let datamodel_dir = tempfile::tempdir().unwrap();
+    let datamodel_path = write_file_to_tmp(&datamodel, &datamodel_dir, "schema.prisma");
+
+    let (result, diff) = diff_result(
+        DatasourceUrls {
+            url: Some(api.connection_string().to_owned()),
+            shadow_database_url: Some(api.create_external_shadow_database()),
+        },
+        DiffParams {
+            exit_code: Some(true),
+            from: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+            to: DiffTarget::SchemaDatamodel(SchemasContainer {
+                files: vec![SchemaContainer {
+                    path: datamodel_path.to_string_lossy().into_owned(),
+                    content: datamodel,
+                }],
+            }),
+            script: false,
+            filters: SchemaFilter::default(),
+        },
+    );
+
+    assert_eq!(result.exit_code, 0);
+    let expected_diff = expect![[r#"
+        No difference detected.
+    "#]];
+    expected_diff.assert_eq(&diff);
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_schema_datamodel_to_migrations_ignores_manual_partial_indexes_without_preview_feature(api: TestApi) {
+    let migrations_dir = tempfile::tempdir().unwrap();
+    let migration_dir = migrations_dir.path().join("01init");
+    let migration_file = migration_dir.join("migration.sql");
+    let schema_name = api.schema_name();
+
+    std::fs::write(
+        migrations_dir.path().join("migration_lock.toml"),
+        format!("provider = \"{}\"", api.args().provider()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&migration_dir).unwrap();
+    std::fs::write(
+        migration_file,
+        format!(
+            r#"CREATE SCHEMA IF NOT EXISTS "{schema_name}";
+             CREATE TABLE "{schema_name}"."User" (
+                 "id" INTEGER NOT NULL,
+                 "email" TEXT NOT NULL,
+                 CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+             );
+             CREATE INDEX "User_email_partial_idx" ON "{schema_name}"."User" ("email") WHERE "email" IS NOT NULL;"#
+        ),
+    )
+    .unwrap();
+
+    let datamodel = api.datamodel_with_provider(
+        r#"
+        model User {
+            id    Int    @id
+            email String
+        }
+    "#,
+    );
+    let datamodel_dir = tempfile::tempdir().unwrap();
+    let datamodel_path = write_file_to_tmp(&datamodel, &datamodel_dir, "schema.prisma");
+
+    let (result, diff) = diff_result(
+        DatasourceUrls {
+            url: Some(api.connection_string().to_owned()),
+            shadow_database_url: Some(api.create_external_shadow_database()),
+        },
+        DiffParams {
+            exit_code: Some(true),
+            from: DiffTarget::SchemaDatamodel(SchemasContainer {
+                files: vec![SchemaContainer {
+                    path: datamodel_path.to_string_lossy().into_owned(),
+                    content: datamodel,
+                }],
+            }),
+            to: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+            script: false,
+            filters: SchemaFilter::default(),
+        },
+    );
+
+    let expected_diff = expect![[r#"
+        No difference detected.
+    "#]];
+    expected_diff.assert_eq(&diff);
+    assert_eq!(result.exit_code, 0);
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn from_migrations_to_url_ignores_manual_partial_indexes_with_engine_seeded_schema(api: TestApi) {
+    let migrations_dir = tempfile::tempdir().unwrap();
+    let migration_dir = migrations_dir.path().join("01init");
+    let migration_file = migration_dir.join("migration.sql");
+    let schema_name = api.schema_name();
+
+    std::fs::write(
+        migrations_dir.path().join("migration_lock.toml"),
+        format!("provider = \"{}\"", api.args().provider()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&migration_dir).unwrap();
+    std::fs::write(
+        migration_file,
+        format!(
+            r#"CREATE SCHEMA IF NOT EXISTS "{schema_name}";
+             CREATE TABLE "{schema_name}"."User" (
+                 "id" INTEGER NOT NULL,
+                 "email" TEXT NOT NULL,
+                 CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+             );
+             CREATE INDEX "User_email_partial_idx" ON "{schema_name}"."User" ("email") WHERE "email" IS NOT NULL;"#
+        ),
+    )
+    .unwrap();
+
+    // Initial datamodel seeded into the engine (without partialIndexes preview feature).
+    // This exercises the EngineState::preview_features() -> diff_cli path.
+    let initial_datamodel = api.datamodel_with_provider(
+        r#"
+        model User {
+            id    Int    @id
+            email String
+        }
+    "#,
+    );
+
+    // Apply the migration to create the table + partial index
+    api.raw_cmd(&format!(
+        r#"CREATE TABLE "{schema_name}"."User" (
+             "id" INTEGER NOT NULL,
+             "email" TEXT NOT NULL,
+             CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+         );
+         CREATE INDEX "User_email_partial_idx" ON "{schema_name}"."User" ("email") WHERE "email" IS NOT NULL;"#,
+    ));
+
+    let (result, diff) = diff_result_with_initial_datamodel(
+        Some(initial_datamodel),
+        DatasourceUrls {
+            url: Some(api.connection_string().to_owned()),
+            shadow_database_url: Some(api.create_external_shadow_database()),
+        },
+        DiffParams {
+            exit_code: Some(true),
+            from: DiffTarget::Migrations(list_migrations(migrations_dir.path()).unwrap()),
+            to: DiffTarget::Url(UrlContainer {
+                url: api.connection_string().to_owned(),
+            }),
+            script: false,
+            filters: SchemaFilter::default(),
+        },
+    );
+
+    assert_eq!(result.exit_code, 0);
+    let expected_diff = expect![[r#"
+        No difference detected.
+    "#]];
+    expected_diff.assert_eq(&diff);
 }
 
 #[test]
@@ -936,7 +1242,6 @@ fn diffing_mongo_schemas_works() {
                 content: from.to_string(),
             }],
         }),
-        shadow_database_url: None,
         to: DiffTarget::SchemaDatamodel(SchemasContainer {
             files: vec![SchemaContainer {
                 path: to_file.to_string_lossy().into_owned(),
@@ -989,7 +1294,6 @@ fn diff_with_exit_code_and_empty_diff_returns_zero() {
                 }],
             }),
             script: false,
-            shadow_database_url: None,
             filters: SchemaFilter::default(),
         },
     );
@@ -1030,7 +1334,6 @@ fn diff_with_exit_code_and_non_empty_diff_returns_two() {
                 }],
             }),
             script: false,
-            shadow_database_url: None,
             filters: SchemaFilter::default(),
         },
     );
@@ -1058,7 +1361,6 @@ fn diff_with_non_existing_sqlite_database_from_url() {
             exit_code: Some(true),
             from: DiffTarget::Empty,
             script: false,
-            shadow_database_url: None,
             to: DiffTarget::Url(UrlContainer {
                 url: format!("file:{}", tmpdir.path().join("db.sqlite").to_string_lossy()),
             }),
@@ -1094,7 +1396,6 @@ fn diff_with_non_existing_sqlite_database_from_datasource() {
             exit_code: Some(true),
             from: DiffTarget::Empty,
             script: false,
-            shadow_database_url: None,
             to: DiffTarget::SchemaDatasource(SchemasWithConfigDir {
                 files: vec![SchemaContainer {
                     path: schema_path.to_string_lossy().into_owned(),
@@ -1166,7 +1467,6 @@ fn from_multi_file_schema_datasource_to_url(mut api: TestApi) {
             config_dir: base_dir.path().to_string_lossy().into_owned(),
         }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter::default(),
     };
@@ -1232,7 +1532,6 @@ fn from_multi_file_schema_datamodel_to_url(mut api: TestApi) {
         exit_code: None,
         from: DiffTarget::SchemaDatamodel(SchemasContainer { files: from_files }),
         script: true,
-        shadow_database_url: None,
         to: DiffTarget::Url(UrlContainer { url: second_url }),
         filters: SchemaFilter::default(),
     };
@@ -1259,8 +1558,19 @@ pub(crate) fn diff_error(datasource_urls: DatasourceUrls, params: DiffParams) ->
 // Call diff, and expect it to succeed. Return the result and what would be printed to stdout.
 #[track_caller]
 pub(crate) fn diff_result(datasource_urls: DatasourceUrls, params: DiffParams) -> (DiffResult, String) {
+    diff_result_with_initial_datamodel(None, datasource_urls, params)
+}
+
+// Call diff with an initial datamodel seeded into the engine state.
+#[track_caller]
+pub(crate) fn diff_result_with_initial_datamodel(
+    initial_datamodel: Option<String>,
+    datasource_urls: DatasourceUrls,
+    params: DiffParams,
+) -> (DiffResult, String) {
     let host = Arc::new(TestConnectorHost::default());
-    let api = schema_core::schema_api_without_extensions(None, datasource_urls, Some(host.clone())).unwrap();
+    let api =
+        schema_core::schema_api_without_extensions(initial_datamodel, datasource_urls, Some(host.clone())).unwrap();
     let result = test_setup::runtime::run_with_thread_local_runtime(api.diff(params)).unwrap();
     let printed_messages = host.printed_messages.lock().unwrap();
     assert!(printed_messages.len() == 1, "{printed_messages:?}");

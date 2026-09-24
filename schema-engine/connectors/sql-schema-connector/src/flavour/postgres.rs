@@ -424,7 +424,7 @@ impl SqlConnector for PostgresConnector {
                     let ns = row.get("table_namespace").and_then(|s| s.to_string());
                     let table_name = row.get("table_name").and_then(|s| s.to_string());
 
-                    ns.and_then(|ns| table_name.map(|table_name| (ns, table_name)))
+                    ns.zip(table_name)
                 })
                 .filter(|(ns, table_name)| {
                     !self
@@ -703,9 +703,8 @@ async fn sql_schema_from_migrations_and_db(
             migration.migration_name()
         );
 
-        conn.raw_cmd(&script)
+        conn.apply_migration_script(migration.migration_name(), &script)
             .await
-            .map_err(imp::quaint_error_mapper(params))
             .map_err(|connector_error| {
                 connector_error.into_migration_does_not_apply_cleanly(migration.migration_name().to_owned())
             })?;
@@ -749,15 +748,8 @@ async fn setup_connection(
 
     let version = schema_exists_result
         .first()
-        .and_then(|row| {
-            row.at(1)
-                .and_then(|ver_str| row.at(2).map(|ver_num| (ver_str, ver_num)))
-        })
-        .and_then(|(ver_str, ver_num)| {
-            ver_str
-                .to_string()
-                .and_then(|version| ver_num.as_integer().map(|version_number| (version, version_number)))
-        });
+        .and_then(|row| row.at(1).zip(row.at(2)))
+        .and_then(|(ver_str, ver_num)| ver_str.to_string().zip(ver_num.as_integer()));
 
     match version {
         Some((version, version_num)) => {

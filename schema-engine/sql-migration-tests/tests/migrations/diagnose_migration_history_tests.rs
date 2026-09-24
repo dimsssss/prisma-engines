@@ -283,6 +283,67 @@ fn diagnose_migrations_history_can_detect_when_the_database_is_behind(api: TestA
 }
 
 #[test_connector]
+fn diagnose_migrations_history_reports_rolled_back_migration_as_unapplied(api: TestApi) {
+    let directory = api.create_migrations_directory();
+
+    let dm1 = api.datamodel_with_provider(
+        r#"
+        model Cat {
+            id   Int @id
+            name String
+        }
+    "#,
+    );
+
+    api.create_migration("initial", &dm1, &directory).send_sync();
+    api.apply_migrations(&directory).send_sync();
+
+    let dm2 = api.datamodel_with_provider(
+        r#"
+        model Cat {
+            id          Int @id
+            name        String
+            fluffiness  Float
+        }
+    "#,
+    );
+
+    let rolled_back_migration_name = api
+        .create_migration("02_add_fluffiness", &dm2, &directory)
+        .send_sync()
+        .modify_migration(|script| {
+            script.clear();
+            script.push_str("SELECT YOLO;");
+        })
+        .into_output()
+        .generated_migration_name;
+
+    api.apply_migrations(&directory).send_unwrap_err();
+    api.mark_migration_rolled_back(&rolled_back_migration_name).send();
+
+    let DiagnoseMigrationHistoryOutput {
+        drift,
+        history,
+        failed_migration_names,
+        edited_migration_names,
+        has_migrations_table,
+        error_in_unapplied_migration,
+    } = api.diagnose_migration_history(&directory).send_sync().into_output();
+
+    assert!(drift.is_none());
+    assert!(failed_migration_names.is_empty());
+    assert!(edited_migration_names.is_empty());
+    assert_eq!(
+        history,
+        Some(HistoryDiagnostic::DatabaseIsBehind {
+            unapplied_migration_names: vec![rolled_back_migration_name],
+        })
+    );
+    assert!(has_migrations_table);
+    assert!(error_in_unapplied_migration.is_none());
+}
+
+#[test_connector]
 fn diagnose_migrations_history_can_detect_when_the_folder_is_behind(api: TestApi) {
     let directory = api.create_migrations_directory();
 
@@ -737,6 +798,56 @@ fn dmh_with_an_invalid_unapplied_migration_should_report_it(api: TestApi) {
         error_in_unapplied_migration.unwrap_known().error_code,
         user_facing_errors::schema_engine::MigrationDoesNotApplyCleanly::ERROR_CODE,
     );
+}
+
+#[test_connector(tags(Postgres), exclude(CockroachDb))]
+fn diagnose_migration_history_ignores_manual_partial_indexes_without_preview_feature(api: TestApi) {
+    let directory = api.create_migrations_directory();
+    let migration_dir = directory.path().join("01init");
+    let migration_file = migration_dir.join("migration.sql");
+    let schema_name = api.schema_name();
+
+    std::fs::write(
+        directory.path().join("migration_lock.toml"),
+        format!("provider = \"{}\"", api.args().provider()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&migration_dir).unwrap();
+    std::fs::write(
+        migration_file,
+        format!(
+            "CREATE SCHEMA IF NOT EXISTS \"{schema_name}\";\n\
+             CREATE TABLE \"{schema_name}\".\"User\" (\n\
+                 \"id\" INTEGER NOT NULL,\n\
+                 \"email\" TEXT NOT NULL,\n\
+                 CONSTRAINT \"User_pkey\" PRIMARY KEY (\"id\")\n\
+             );\n\
+             CREATE INDEX \"User_email_partial_idx\" ON \"{schema_name}\".\"User\" (\"email\") WHERE \"email\" IS NOT NULL;\n"
+        ),
+    )
+    .unwrap();
+
+    api.apply_migrations(&directory).send_sync();
+
+    let DiagnoseMigrationHistoryOutput {
+        drift,
+        history,
+        failed_migration_names,
+        edited_migration_names,
+        has_migrations_table,
+        error_in_unapplied_migration,
+    } = api
+        .diagnose_migration_history(&directory)
+        .opt_in_to_shadow_database(true)
+        .send_sync()
+        .into_output();
+
+    assert!(has_migrations_table);
+    assert!(drift.is_none());
+    assert!(history.is_none());
+    assert!(failed_migration_names.is_empty());
+    assert!(edited_migration_names.is_empty());
+    assert!(error_in_unapplied_migration.is_none());
 }
 
 #[test_connector(tags(Postgres), exclude(CockroachDb))]
