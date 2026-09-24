@@ -219,7 +219,7 @@ impl SqlConnector for MssqlConnector {
             let (db_name, master_uri) = Self::master_url(connection_string)?;
             let mut master_conn = Connection::new(&master_uri).await?;
 
-            let query = format!("CREATE DATABASE [{db_name}]");
+            let query = format!("CREATE DATABASE [{}]", db_name.replace(']', "]]"));
             master_conn
                 .raw_cmd(
                     &query,
@@ -263,10 +263,13 @@ impl SqlConnector for MssqlConnector {
         Box::pin(async {
             let params = self.state.get_unwrapped_params();
             let (db_name, master_uri) = Self::master_url(&params.connector_params.connection_string)?;
-            assert!(db_name != "master", "Cannot drop the `master` database.");
+            if db_name == "master" {
+                return Err(ConnectorError::from_msg("Cannot drop the `master` database.".to_owned()));
+            }
+            
             let mut conn = Connection::new(&master_uri.to_string()).await?;
 
-            let query = format!("DROP DATABASE IF EXISTS [{db_name}]");
+            let query = format!("DROP DATABASE IF EXISTS [{}]", db_name.replace(']', "]]"));
             conn.raw_cmd(
                 &query,
                 &Params {
