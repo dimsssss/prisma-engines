@@ -103,8 +103,12 @@ impl MssqlUrl {
         let db = self.query_params.database();
         match percent_decode(db.as_bytes()).decode_utf8() {
             Ok(decoded) => decoded,
-            Err(_) => {
-                tracing::warn!("Couldn't decode dbname to UTF-8, using the non-decoded version.");
+            Err(e) => {
+                tracing::warn!(
+                    "Couldn't decode dbname '{}' to UTF-8: {}. Using the non-decoded version.",
+                    db,
+                    e
+                );
                 Cow::Borrowed(db)
             }
         }
