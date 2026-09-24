@@ -422,6 +422,16 @@ mod tests {
     }
 
     #[test]
+    fn should_fallback_to_original_dbname_on_invalid_utf8() {
+        // %FF is not a valid UTF-8 sequence
+        let url = MssqlUrl::new(
+            "sqlserver://localhost:1433;database=test%FF;user=SA;password=pass;trustServerCertificate=true",
+        )
+        .unwrap();
+        assert_eq!("test%FF", url.dbname());
+    }
+
+    #[test]
     fn should_return_master_as_default_dbname() {
         let url =
             MssqlUrl::new("sqlserver://localhost:1433;user=SA;password=pass;trustServerCertificate=true").unwrap();
